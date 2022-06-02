@@ -97,7 +97,6 @@ struct amf_data {
 	AMF_SURFACE_FORMAT amf_format;
 
 	std::vector<handle_tex> input_textures;
-	std::deque<int64_t> dts_list;
 
 	uint32_t cx;
 	uint32_t cy;
