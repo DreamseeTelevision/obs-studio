@@ -711,8 +711,7 @@ try {
 	set_avc_property(enc, PROFILE, get_avc_profile(settings));
 	set_avc_property(enc, LOWLATENCY_MODE, false);
 	set_avc_property(enc, CABAC_ENABLE, AMF_VIDEO_ENCODER_UNDEFINED);
-	set_avc_property(enc, PRE_ANALYSIS_ENABLE,
-			 AMF_VIDEO_ENCODER_PREENCODE_ENABLED);
+	set_avc_property(enc, PREENCODE_ENABLE, true);
 	set_avc_property(enc, OUTPUT_COLOR_PROFILE, enc->amf_color_profile);
 	set_avc_property(enc, OUTPUT_TRANSFER_CHARACTERISTIC,
 			 enc->amf_characteristic);
