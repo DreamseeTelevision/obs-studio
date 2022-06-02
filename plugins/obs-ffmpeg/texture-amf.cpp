@@ -370,30 +370,36 @@ try {
 	/* ------------------------------------ */
 	/* do actual encode                     */
 
-	res = enc->amf_encoder->SubmitInput(amf_surf);
-	if (res != AMF_OK)
-		throw amf_error("SubmitInput failed", res);
-
 	for (;;) {
-		res = enc->amf_encoder->QueryOutput(&amf_out);
+		res = enc->amf_encoder->SubmitInput(amf_surf);
 		if (res == AMF_OK)
 			break;
 
-		switch (res) {
-		case AMF_NEED_MORE_INPUT:
+		if (res == AMF_INPUT_FULL) {
+			os_sleep_ms(1);
+
+		} else if (res == AMF_NEED_MORE_INPUT) {
 			*received_packet = false;
 			return true;
-		case AMF_REPEAT:
-			break;
-		default:
-			throw amf_error("QueryOutput failed", res);
-		}
 
-		os_sleep_ms(1);
+		} else {
+			throw amf_error("SubmitInput failed", res);
+		}
+	}
+
+	res = enc->amf_encoder->QueryOutput(&amf_out);
+
+	if (res == AMF_REPEAT) {
+		*received_packet = false;
+		return true;
+
+	} else if (res != AMF_OK) {
+		throw amf_error("QueryOutput failed", res);
 	}
 
 	*received_packet = true;
 	convert_to_encoder_packet(enc, amf_out, packet);
+
 	return true;
 
 } catch (const char *err) {
