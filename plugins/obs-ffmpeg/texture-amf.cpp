@@ -752,7 +752,6 @@ static void register_avc()
 	amf_encoder_info.create = amf_avc_create;
 	amf_encoder_info.destroy = amf_destroy;
 	amf_encoder_info.encode_texture = amf_encode_tex;
-	amf_encoder_info.update = amf_avc_update;
 	amf_encoder_info.get_defaults = amf_defaults;
 	amf_encoder_info.get_properties = amf_avc_properties;
 	amf_encoder_info.get_extra_data = amf_extra_data;
@@ -982,7 +981,6 @@ static void register_hevc()
 	amf_encoder_info.create = amf_hevc_create;
 	amf_encoder_info.destroy = amf_destroy;
 	amf_encoder_info.encode_texture = amf_encode_tex;
-	amf_encoder_info.update = amf_hevc_update;
 	amf_encoder_info.get_defaults = amf_defaults;
 	amf_encoder_info.get_properties = amf_hevc_properties;
 	amf_encoder_info.get_extra_data = amf_extra_data;
