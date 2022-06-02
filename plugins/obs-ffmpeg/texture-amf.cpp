@@ -366,7 +366,6 @@ try {
 
 	amf_surf->SetPts(cur_ts);
 	amf_surf->SetProperty(L"PTS", pts);
-	amf_surf->SetDuration(cur_ts - last_ts);
 
 	/* ------------------------------------ */
 	/* do actual encode                     */
