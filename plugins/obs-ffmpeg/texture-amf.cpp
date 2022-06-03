@@ -472,7 +472,7 @@ try {
 	/* map output tex to amf surface        */
 
 	res = enc->amf_context->CreateSurfaceFromDX11Native(output_tex,
-							    &amf_surf, nullptr);
+							    &amf_surf, enc);
 	if (res != AMF_OK)
 		throw amf_error("CreateSurfaceFromDX11Native failed", res);
 
@@ -481,7 +481,6 @@ try {
 
 	amf_surf->SetPts(cur_ts);
 	amf_surf->SetProperty(L"PTS", pts);
-	amf_surf->AddObserver(enc);
 
 	enc->active_textures[amf_surf.GetPtr()] = output_tex;
 
