@@ -116,7 +116,7 @@ struct amf_data : public AMFSurfaceObserver {
 
 	AMFBufferPtr header;
 
-	void OnSurfaceDataRelease(amf::AMFSurface *surf) override
+	void AMF_STD_CALL OnSurfaceDataRelease(amf::AMFSurface *surf) override
 	{
 		std::scoped_lock lock(textures_mutex);
 
