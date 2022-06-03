@@ -111,6 +111,8 @@ struct amf_data : public AMFSurfaceObserver {
 	int fps_num;
 	int fps_den;
 	bool full_range;
+	bool bframes_supported = false;
+	bool using_bframes = false;
 
 	AMFBufferPtr header;
 
@@ -130,6 +132,13 @@ struct amf_data : public AMFSurfaceObserver {
 /* More garbage                                                              */
 
 template<typename T>
+static bool get_amf_property(amf_data *enc, const wchar_t *name, T *value)
+{
+	AMF_RESULT res = enc->amf_encoder->GetProperty(name, value);
+	return res == AMF_OK;
+}
+
+template<typename T>
 static void set_amf_property(amf_data *enc, const wchar_t *name, const T &value)
 {
 	AMF_RESULT res = enc->amf_encoder->SetProperty(name, value);
@@ -142,6 +151,11 @@ static void set_amf_property(amf_data *enc, const wchar_t *name, const T &value)
 	set_amf_property(enc, AMF_VIDEO_ENCODER_##name, value)
 #define set_hevc_property(enc, name, value) \
 	set_amf_property(enc, AMF_VIDEO_ENCODER_HEVC_##name, value)
+
+#define get_avc_property(enc, name, value) \
+	get_amf_property(enc, AMF_VIDEO_ENCODER_##name, value)
+#define get_hevc_property(enc, name, value) \
+	get_amf_property(enc, AMF_VIDEO_ENCODER_HEVC_##name, value)
 
 #define get_opt_name(name)                                              \
 	((enc->codec == amf_codec_type::AVC) ? AMF_VIDEO_ENCODER_##name \
@@ -357,6 +371,9 @@ static void convert_to_encoder_packet(amf_data *enc, AMFDataPtr &data,
 	packet->type = OBS_ENCODER_VIDEO;
 	packet->dts = convert_to_obs_ts(enc, data->GetPts());
 	packet->keyframe = type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR;
+
+	if (enc->using_bframes)
+		packet->dts -= 2;
 }
 
 static bool amf_encode_tex(void *data, uint32_t handle, int64_t pts,
@@ -780,6 +797,23 @@ try {
 	res = enc->amf_encoder->GetProperty(AMF_VIDEO_ENCODER_EXTRADATA, &p);
 	if (res == AMF_OK && p.type == AMF_VARIANT_INTERFACE)
 		enc->header = AMFBufferPtr(p.pInterface);
+
+	AMFCapsPtr caps;
+	res = enc->amf_encoder->GetCaps(&caps);
+	if (res == AMF_OK)
+		caps->GetProperty(AMF_VIDEO_ENCODER_CAP_BFRAMES,
+				  &enc->bframes_supported);
+
+	if (enc->bframes_supported) {
+		amf_int64 b_frames = 0;
+		amf_int64 b_max = 0;
+
+		if (get_avc_property(enc, B_PIC_PATTERN, &b_frames) &&
+		    get_avc_property(enc, MAX_CONSECUTIVE_BPICTURES, &b_max))
+			enc->using_bframes = b_frames && b_max;
+		else
+			enc->using_bframes = false;
+	}
 
 	return enc;
 
