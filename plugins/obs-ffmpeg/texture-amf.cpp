@@ -395,9 +395,9 @@ static void convert_to_encoder_packet(amf_base *enc, AMFDataPtr &data,
 }
 
 static void amf_encode_base(amf_base *enc, AMFSurface *amf_surf,
-			    AMFDataPtr &amf_out, encoder_packet *packet,
-			    bool *received_packet)
+			    encoder_packet *packet, bool *received_packet)
 {
+	AMFDataPtr amf_out;
 	AMF_RESULT res;
 
 	for (;;) {
@@ -441,7 +441,6 @@ try {
 	ComPtr<ID3D11Texture2D> input_tex;
 	ComPtr<IDXGIKeyedMutex> km;
 	AMFSurfacePtr amf_surf;
-	AMFDataPtr amf_out;
 	AMF_RESULT res;
 
 	if (handle == GS_INVALID_HANDLE) {
@@ -487,7 +486,7 @@ try {
 	/* ------------------------------------ */
 	/* do actual encode                     */
 
-	amf_encode_base(enc, amf_surf, amf_out, packet, received_packet);
+	amf_encode_base(enc, amf_surf, packet, received_packet);
 	return true;
 
 } catch (const char *err) {
