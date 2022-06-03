@@ -4,10 +4,12 @@
 
 #include "obs-ffmpeg-config.h"
 
+#include <unordered_map>
 #include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
+#include <mutex>
 #include <deque>
 #include <map>
 
@@ -79,8 +81,16 @@ enum class amf_codec_type {
 	HEVC,
 };
 
-struct amf_data {
+struct amf_data : public AMFSurfaceObserver {
 	obs_encoder_t *encoder;
+
+	std::vector<handle_tex> input_textures;
+
+	using d3dtex_t = ComPtr<ID3D11Texture2D>;
+
+	std::mutex textures_mutex;
+	std::vector<d3dtex_t> available_textures;
+	std::unordered_map<AMFSurface *, d3dtex_t> active_textures;
 
 	ComPtr<ID3D11Device> device;
 	ComPtr<ID3D11DeviceContext> context;
@@ -96,8 +106,6 @@ struct amf_data {
 	AMF_COLOR_PRIMARIES_ENUM amf_primaries;
 	AMF_SURFACE_FORMAT amf_format;
 
-	std::vector<handle_tex> input_textures;
-
 	uint32_t cx;
 	uint32_t cy;
 	int fps_num;
@@ -105,6 +113,17 @@ struct amf_data {
 	bool full_range;
 
 	AMFBufferPtr header;
+
+	void OnSurfaceDataRelease(amf::AMFSurface *surf) override
+	{
+		std::scoped_lock lock(textures_mutex);
+
+		auto it = active_textures.find(surf);
+		if (it != active_textures.end()) {
+			available_textures.push_back(it->second);
+			active_textures.erase(it);
+		}
+	}
 };
 
 /* ------------------------------------------------------------------------- */
@@ -216,7 +235,8 @@ try {
 	return false;
 }
 
-static inline void create_texture(amf_data *enc, ID3D11Texture2D *from)
+static void add_output_tex(amf_data *enc, ComPtr<ID3D11Texture2D> &output_tex,
+			   ID3D11Texture2D *from)
 {
 	ID3D11Device *device = enc->device;
 	HRESULT hr;
@@ -226,9 +246,30 @@ static inline void create_texture(amf_data *enc, ID3D11Texture2D *from)
 	desc.BindFlags = D3D11_BIND_RENDER_TARGET;
 	desc.MiscFlags = 0;
 
-	hr = device->CreateTexture2D(&desc, nullptr, &enc->texture);
+	hr = device->CreateTexture2D(&desc, nullptr, &output_tex);
 	if (FAILED(hr))
 		throw HRError("Failed to create texture", hr);
+}
+
+static inline bool get_available_tex(amf_data *enc,
+				     ComPtr<ID3D11Texture2D> &output_tex)
+{
+	std::scoped_lock lock(enc->textures_mutex);
+	if (enc->available_textures.size()) {
+		output_tex = enc->available_textures.back();
+		enc->available_textures.pop_back();
+		return true;
+	}
+
+	return false;
+}
+
+static inline void get_output_tex(amf_data *enc,
+				  ComPtr<ID3D11Texture2D> &output_tex,
+				  ID3D11Texture2D *from)
+{
+	if (!get_available_tex(enc, output_tex))
+		add_output_tex(enc, output_tex, from);
 }
 
 static void get_tex_from_handle(amf_data *enc, uint32_t handle,
@@ -336,10 +377,15 @@ try {
 		throw "Encode failed: bad texture handle";
 	}
 
+	/* ------------------------------------ */
+	/* get the input tex                    */
+
 	get_tex_from_handle(enc, handle, &km, &input_tex);
-	if (!enc->texture)
-		create_texture(enc, input_tex);
-	output_tex = enc->texture;
+
+	/* ------------------------------------ */
+	/* get an output tex                    */
+
+	get_output_tex(enc, output_tex, input_tex);
 
 	/* ------------------------------------ */
 	/* copy to output tex                   */
@@ -353,8 +399,6 @@ try {
 	/* ------------------------------------ */
 	/* map output tex to amf surface        */
 
-	/* XXX: does this really need to be recreated every frame? */
-
 	res = enc->amf_context->CreateSurfaceFromDX11Native(output_tex,
 							    &amf_surf, nullptr);
 	if (res != AMF_OK)
@@ -365,6 +409,9 @@ try {
 
 	amf_surf->SetPts(cur_ts);
 	amf_surf->SetProperty(L"PTS", pts);
+	amf_surf->AddObserver(enc);
+
+	enc->active_textures[amf_surf.GetPtr()] = output_tex;
 
 	/* ------------------------------------ */
 	/* do actual encode                     */
