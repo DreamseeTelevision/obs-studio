@@ -13,7 +13,7 @@ static bool str_to_bool(const char *str)
 	return false;
 }
 
-static void amf_apply_opt(amf_data *enc, obs_option *opt)
+static void amf_apply_opt(amf_base *enc, obs_option *opt)
 {
 	bool avc = enc->codec == amf_codec_type::AVC;
 	bool hevc = enc->codec == amf_codec_type::HEVC;

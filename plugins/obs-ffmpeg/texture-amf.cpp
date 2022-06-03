@@ -1,3 +1,4 @@
+#include <util/threading.h>
 #include <opts-parser.h>
 #include <obs-module.h>
 #include <obs-avc.h>
@@ -81,26 +82,16 @@ enum class amf_codec_type {
 	HEVC,
 };
 
-struct amf_data : public AMFSurfaceObserver {
+struct amf_base {
 	obs_encoder_t *encoder;
-
-	std::vector<handle_tex> input_textures;
-
-	using d3dtex_t = ComPtr<ID3D11Texture2D>;
-
-	std::mutex textures_mutex;
-	std::vector<d3dtex_t> available_textures;
-	std::unordered_map<AMFSurface *, d3dtex_t> active_textures;
-
-	ComPtr<ID3D11Device> device;
-	ComPtr<ID3D11DeviceContext> context;
-	ComPtr<ID3D11Texture2D> texture;
-
 	amf_codec_type codec;
+
 	AMFContextPtr amf_context;
 	AMFComponentPtr amf_encoder;
 	AMFBufferPtr packet_data;
 	AMFRate amf_frame_rate;
+	AMFBufferPtr header;
+
 	AMF_VIDEO_CONVERTER_COLOR_PROFILE_ENUM amf_color_profile;
 	AMF_COLOR_TRANSFER_CHARACTERISTIC_ENUM amf_characteristic;
 	AMF_COLOR_PRIMARIES_ENUM amf_primaries;
@@ -114,10 +105,31 @@ struct amf_data : public AMFSurfaceObserver {
 	bool bframes_supported = false;
 	bool using_bframes = false;
 
-	AMFBufferPtr header;
+	virtual ~amf_base() = default;
+};
+
+struct amf_texencode : amf_base, public AMFSurfaceObserver {
+	volatile bool destroying = false;
+
+	std::vector<handle_tex> input_textures;
+
+	using d3dtex_t = ComPtr<ID3D11Texture2D>;
+
+	std::mutex textures_mutex;
+	std::vector<d3dtex_t> available_textures;
+	std::unordered_map<AMFSurface *, d3dtex_t> active_textures;
+
+	ComPtr<ID3D11Device> device;
+	ComPtr<ID3D11DeviceContext> context;
+	ComPtr<ID3D11Texture2D> texture;
+
+	~amf_texencode() { os_atomic_set_bool(&destroying, true); }
 
 	void AMF_STD_CALL OnSurfaceDataRelease(amf::AMFSurface *surf) override
 	{
+		if (os_atomic_load_bool(&destroying))
+			return;
+
 		std::scoped_lock lock(textures_mutex);
 
 		auto it = active_textures.find(surf);
@@ -132,14 +144,14 @@ struct amf_data : public AMFSurfaceObserver {
 /* More garbage                                                              */
 
 template<typename T>
-static bool get_amf_property(amf_data *enc, const wchar_t *name, T *value)
+static bool get_amf_property(amf_base *enc, const wchar_t *name, T *value)
 {
 	AMF_RESULT res = enc->amf_encoder->GetProperty(name, value);
 	return res == AMF_OK;
 }
 
 template<typename T>
-static void set_amf_property(amf_data *enc, const wchar_t *name, const T &value)
+static void set_amf_property(amf_base *enc, const wchar_t *name, const T &value)
 {
 	AMF_RESULT res = enc->amf_encoder->SetProperty(name, value);
 	if (res != AMF_OK)
@@ -173,26 +185,23 @@ static void set_amf_property(amf_data *enc, const wchar_t *name, const T &value)
 /* ------------------------------------------------------------------------- */
 /* Implementation                                                            */
 
-static HMODULE get_lib(amf_data *enc, const char *lib)
+static HMODULE get_lib(const char *lib)
 {
 	HMODULE mod = GetModuleHandleA(lib);
 	if (mod)
 		return mod;
 
-	mod = LoadLibraryA(lib);
-	if (!mod)
-		error("Failed to load %s", lib);
-	return mod;
+	return LoadLibraryA(lib);
 }
 
 #define AMD_VENDOR_ID 0x1002
 
 typedef HRESULT(WINAPI *CREATEDXGIFACTORY1PROC)(REFIID, void **);
 
-static bool amf_init_d3d11(amf_data *enc)
+static bool amf_init_d3d11(amf_texencode *enc)
 try {
-	HMODULE dxgi = get_lib(enc, "DXGI.dll");
-	HMODULE d3d11 = get_lib(enc, "D3D11.dll");
+	HMODULE dxgi = get_lib("DXGI.dll");
+	HMODULE d3d11 = get_lib("D3D11.dll");
 	CREATEDXGIFACTORY1PROC create_dxgi;
 	PFN_D3D11_CREATE_DEVICE create_device;
 	ComPtr<IDXGIFactory> factory;
@@ -249,7 +258,8 @@ try {
 	return false;
 }
 
-static void add_output_tex(amf_data *enc, ComPtr<ID3D11Texture2D> &output_tex,
+static void add_output_tex(amf_texencode *enc,
+			   ComPtr<ID3D11Texture2D> &output_tex,
 			   ID3D11Texture2D *from)
 {
 	ID3D11Device *device = enc->device;
@@ -265,7 +275,7 @@ static void add_output_tex(amf_data *enc, ComPtr<ID3D11Texture2D> &output_tex,
 		throw HRError("Failed to create texture", hr);
 }
 
-static inline bool get_available_tex(amf_data *enc,
+static inline bool get_available_tex(amf_texencode *enc,
 				     ComPtr<ID3D11Texture2D> &output_tex)
 {
 	std::scoped_lock lock(enc->textures_mutex);
@@ -278,7 +288,7 @@ static inline bool get_available_tex(amf_data *enc,
 	return false;
 }
 
-static inline void get_output_tex(amf_data *enc,
+static inline void get_output_tex(amf_texencode *enc,
 				  ComPtr<ID3D11Texture2D> &output_tex,
 				  ID3D11Texture2D *from)
 {
@@ -286,7 +296,7 @@ static inline void get_output_tex(amf_data *enc,
 		add_output_tex(enc, output_tex, from);
 }
 
-static void get_tex_from_handle(amf_data *enc, uint32_t handle,
+static void get_tex_from_handle(amf_texencode *enc, uint32_t handle,
 				IDXGIKeyedMutex **km_out,
 				ID3D11Texture2D **tex_out)
 {
@@ -322,19 +332,19 @@ static void get_tex_from_handle(amf_data *enc, uint32_t handle,
 	*tex_out = tex.Detach();
 }
 
-static inline int64_t convert_to_amf_ts(amf_data *enc, int64_t ts)
+static inline int64_t convert_to_amf_ts(amf_base *enc, int64_t ts)
 {
 	constexpr int64_t amf_timebase = AMF_SECOND;
 	return ts * amf_timebase / (int64_t)enc->fps_den;
 }
 
-static inline int64_t convert_to_obs_ts(amf_data *enc, int64_t ts)
+static inline int64_t convert_to_obs_ts(amf_base *enc, int64_t ts)
 {
 	constexpr int64_t amf_timebase = AMF_SECOND;
 	return ts * (int64_t)enc->fps_den / amf_timebase;
 }
 
-static void convert_to_encoder_packet(amf_data *enc, AMFDataPtr &data,
+static void convert_to_encoder_packet(amf_base *enc, AMFDataPtr &data,
 				      encoder_packet *packet)
 {
 	if (!data)
@@ -380,7 +390,7 @@ static bool amf_encode_tex(void *data, uint32_t handle, int64_t pts,
 			   uint64_t lock_key, uint64_t *next_key,
 			   encoder_packet *packet, bool *received_packet)
 try {
-	amf_data *enc = (amf_data *)data;
+	amf_texencode *enc = (amf_texencode *)data;
 	ID3D11DeviceContext *context = enc->context;
 	ComPtr<ID3D11Texture2D> output_tex;
 	ComPtr<ID3D11Texture2D> input_tex;
@@ -466,19 +476,19 @@ try {
 	return true;
 
 } catch (const char *err) {
-	amf_data *enc = (amf_data *)data;
+	amf_texencode *enc = (amf_texencode *)data;
 	error("%s: %s", __FUNCTION__, err);
 	return false;
 
 } catch (const amf_error &err) {
-	amf_data *enc = (amf_data *)data;
+	amf_texencode *enc = (amf_texencode *)data;
 	error("%s: %s: %s", __FUNCTION__, err.str,
 	      amf_trace->GetResultText(err.res));
 	*received_packet = false;
 	return false;
 
 } catch (const HRError &err) {
-	amf_data *enc = (amf_data *)data;
+	amf_texencode *enc = (amf_texencode *)data;
 	error("%s: %s: 0x%lX", __FUNCTION__, err.str, err.hr);
 	*received_packet = false;
 	return false;
@@ -486,7 +496,7 @@ try {
 
 static bool amf_extra_data(void *data, uint8_t **header, size_t *size)
 {
-	amf_data *enc = (amf_data *)data;
+	amf_base *enc = (amf_base *)data;
 	if (!enc->header)
 		return false;
 
@@ -495,7 +505,7 @@ static bool amf_extra_data(void *data, uint8_t **header, size_t *size)
 	return true;
 }
 
-static bool amf_create_encoder(amf_data *enc)
+static bool amf_create_encoder(amf_texencode *enc)
 try {
 	AMF_RESULT res;
 
@@ -600,7 +610,7 @@ try {
 
 static void amf_destroy(void *data)
 {
-	amf_data *enc = (amf_data *)data;
+	amf_base *enc = (amf_base *)data;
 	delete enc;
 }
 
@@ -696,7 +706,7 @@ static inline int get_avc_profile(obs_data_t *settings)
 
 static bool amf_avc_update(void *data, obs_data_t *settings)
 {
-	amf_data *enc = (amf_data *)data;
+	amf_base *enc = (amf_base *)data;
 
 	int64_t bitrate = obs_data_get_int(settings, "bitrate") * 1000;
 	int64_t qp = obs_data_get_int(settings, "cqp");
@@ -764,7 +774,7 @@ try {
 
 	check_texture_encode_capability(encoder, false);
 
-	amf_data *enc = new amf_data;
+	amf_texencode *enc = new amf_texencode;
 	enc->encoder = encoder;
 	enc->codec = amf_codec_type::AVC;
 
@@ -882,7 +892,7 @@ static inline int get_hevc_rate_control(obs_data_t *settings)
 
 static bool amf_hevc_update(void *data, obs_data_t *settings)
 {
-	amf_data *enc = (amf_data *)data;
+	amf_base *enc = (amf_base *)data;
 
 	int64_t bitrate = obs_data_get_int(settings, "bitrate") * 1000;
 	int64_t qp = obs_data_get_int(settings, "cqp");
@@ -943,13 +953,13 @@ static bool amf_hevc_update(void *data, obs_data_t *settings)
 	return true;
 }
 
-static inline bool is_hlg(amf_data *enc)
+static inline bool is_hlg(amf_base *enc)
 {
 	return enc->amf_characteristic ==
 	       AMF_COLOR_TRANSFER_CHARACTERISTIC_ARIB_STD_B67;
 }
 
-static inline bool is_pq(amf_data *enc)
+static inline bool is_pq(amf_base *enc)
 {
 	return enc->amf_characteristic ==
 	       AMF_COLOR_TRANSFER_CHARACTERISTIC_SMPTE2084;
@@ -980,7 +990,7 @@ try {
 
 	check_texture_encode_capability(encoder, true);
 
-	amf_data *enc = new amf_data;
+	amf_texencode *enc = new amf_texencode;
 	enc->encoder = encoder;
 	enc->codec = amf_codec_type::HEVC;
 
