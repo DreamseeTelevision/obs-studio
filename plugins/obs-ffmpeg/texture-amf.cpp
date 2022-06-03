@@ -106,6 +106,7 @@ struct amf_base {
 	bool using_bframes = false;
 
 	virtual ~amf_base() = default;
+	virtual void init() = 0;
 };
 
 struct amf_texencode : amf_base, public AMFSurfaceObserver {
@@ -137,6 +138,13 @@ struct amf_texencode : amf_base, public AMFSurfaceObserver {
 			available_textures.push_back(it->second);
 			active_textures.erase(it);
 		}
+	}
+
+	void init() override
+	{
+		AMF_RESULT res = amf_context->InitDX11(device, AMF_DX11_1);
+		if (res != AMF_OK)
+			throw amf_error("InitDX11 failed", res);
 	}
 };
 
@@ -505,7 +513,7 @@ static bool amf_extra_data(void *data, uint8_t **header, size_t *size)
 	return true;
 }
 
-static bool amf_create_encoder(amf_texencode *enc)
+static bool amf_create_encoder(amf_base *enc)
 try {
 	AMF_RESULT res;
 
@@ -588,9 +596,7 @@ try {
 	if (res != AMF_OK)
 		throw amf_error("CreateContext failed", res);
 
-	res = enc->amf_context->InitDX11(enc->device, AMF_DX11_1);
-	if (res != AMF_OK)
-		throw amf_error("InitDX11 failed", res);
+	enc->init();
 
 	res = amf_factory->CreateComponent(enc->amf_context,
 					   enc->codec == amf_codec_type::HEVC
@@ -767,19 +773,13 @@ static bool amf_avc_update(void *data, obs_data_t *settings)
 	return true;
 }
 
-static void *amf_avc_create(obs_data_t *settings, obs_encoder_t *encoder)
-try {
+static void amf_avc_create_internal(amf_base *enc, obs_data_t *settings)
+{
 	AMF_RESULT res;
 	AMFVariant p;
 
-	check_texture_encode_capability(encoder, false);
-
-	amf_texencode *enc = new amf_texencode;
-	enc->encoder = encoder;
 	enc->codec = amf_codec_type::AVC;
 
-	if (!amf_init_d3d11(enc))
-		throw "Failed to create D3D11";
 	if (!amf_create_encoder(enc))
 		throw "Failed to create encoder";
 
@@ -824,7 +824,20 @@ try {
 		else
 			enc->using_bframes = false;
 	}
+}
 
+static void *amf_avc_create_texencode(obs_data_t *settings,
+				      obs_encoder_t *encoder)
+try {
+	check_texture_encode_capability(encoder, false);
+
+	amf_texencode *enc = new amf_texencode;
+	enc->encoder = encoder;
+
+	if (!amf_init_d3d11(enc))
+		throw "Failed to create D3D11";
+
+	amf_avc_create_internal(enc, settings);
 	return enc;
 
 } catch (const amf_error &err) {
@@ -844,7 +857,7 @@ static void register_avc()
 	amf_encoder_info.type = OBS_ENCODER_VIDEO;
 	amf_encoder_info.codec = "h264";
 	amf_encoder_info.get_name = amf_avc_get_name;
-	amf_encoder_info.create = amf_avc_create;
+	amf_encoder_info.create = amf_avc_create_texencode;
 	amf_encoder_info.destroy = amf_destroy;
 	amf_encoder_info.encode_texture = amf_encode_tex;
 	amf_encoder_info.get_defaults = amf_defaults;
@@ -854,6 +867,13 @@ static void register_avc()
 	amf_encoder_info.caps = OBS_ENCODER_CAP_PASS_TEXTURE;
 
 	obs_register_encoder(&amf_encoder_info);
+
+	/*amf_encoder_info.id = "h264_texture_amf";//_fallback";
+	amf_encoder_info.caps = OBS_ENCODER_CAP_INTERNAL;
+	amf_encoder_info.encode_texture = nullptr;
+	amf_encoder_info.create = amf_avc_create_fallback;
+	amf_encoder_info.encode = amf_encode;
+	obs_register_encoder(&amf_encoder_info);*/
 }
 
 /* ========================================================================= */
