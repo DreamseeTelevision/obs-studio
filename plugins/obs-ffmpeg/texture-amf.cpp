@@ -313,7 +313,7 @@ static void add_output_tex(amf_texencode *enc,
 
 	D3D11_TEXTURE2D_DESC desc;
 	from->GetDesc(&desc);
-	desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+	desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 	desc.MiscFlags = 0;
 
 	hr = device->CreateTexture2D(&desc, nullptr, &output_tex);

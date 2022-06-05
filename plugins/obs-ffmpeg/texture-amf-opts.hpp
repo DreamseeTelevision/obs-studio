@@ -249,15 +249,24 @@ static void amf_apply_opt(amf_base *enc, obs_option *opt)
 	} else {
 		wchar_t wname[256];
 		int val;
+		bool is_bool = false;
 
-		if (astrcmpi(opt->value, "true") == 0)
+		if (astrcmpi(opt->value, "true") == 0) {
+			is_bool = true;
 			val = 1;
-		else if (astrcmpi(opt->value, "false") == 0)
+		} else if (astrcmpi(opt->value, "false") == 0) {
+			is_bool = true;
 			val = 0;
-		else
+		} else {
 			val = atoi(opt->value);
+		}
 
 		os_utf8_to_wcs(opt->name, 0, wname, _countof(wname));
-		set_amf_property(enc, wname, val);
+		if (is_bool) {
+			bool bool_val = (bool)val;
+			set_amf_property(enc, wname, bool_val);
+		} else {
+			set_amf_property(enc, wname, val);
+		}
 	}
 }
