@@ -35,8 +35,8 @@ using namespace amf;
 /* ========================================================================= */
 /* Junk                                                                      */
 
-#define do_log(level, format, ...)                 \
-	blog(level, "[texture-amf: '%s'] " format, \
+#define do_log(level, format, ...)                          \
+	blog(level, "[%s: '%s'] " format, enc->encoder_str, \
 	     obs_encoder_get_name(enc->encoder), ##__VA_ARGS__)
 
 #define error(format, ...) do_log(LOG_ERROR, format, ##__VA_ARGS__)
@@ -84,7 +84,9 @@ enum class amf_codec_type {
 
 struct amf_base {
 	obs_encoder_t *encoder;
+	const char *encoder_str;
 	amf_codec_type codec;
+	bool fallback;
 
 	AMFContextPtr amf_context;
 	AMFComponentPtr amf_encoder;
@@ -99,22 +101,25 @@ struct amf_base {
 
 	uint32_t cx;
 	uint32_t cy;
+	uint32_t linesize = 0;
 	int fps_num;
 	int fps_den;
 	bool full_range;
 	bool bframes_supported = false;
 	bool using_bframes = false;
 
+	inline amf_base(bool fallback) : fallback(fallback) {}
 	virtual ~amf_base() = default;
 	virtual void init() = 0;
 };
+
+using d3dtex_t = ComPtr<ID3D11Texture2D>;
+using buf_t = std::vector<uint8_t>;
 
 struct amf_texencode : amf_base, public AMFSurfaceObserver {
 	volatile bool destroying = false;
 
 	std::vector<handle_tex> input_textures;
-
-	using d3dtex_t = ComPtr<ID3D11Texture2D>;
 
 	std::mutex textures_mutex;
 	std::vector<d3dtex_t> available_textures;
@@ -124,6 +129,7 @@ struct amf_texencode : amf_base, public AMFSurfaceObserver {
 	ComPtr<ID3D11DeviceContext> context;
 	ComPtr<ID3D11Texture2D> texture;
 
+	inline amf_texencode() : amf_base(false) {}
 	~amf_texencode() { os_atomic_set_bool(&destroying, true); }
 
 	void AMF_STD_CALL OnSurfaceDataRelease(amf::AMFSurface *surf) override
@@ -143,6 +149,38 @@ struct amf_texencode : amf_base, public AMFSurfaceObserver {
 	void init() override
 	{
 		AMF_RESULT res = amf_context->InitDX11(device, AMF_DX11_1);
+		if (res != AMF_OK)
+			throw amf_error("InitDX11 failed", res);
+	}
+};
+
+struct amf_fallback : amf_base, public AMFSurfaceObserver {
+	volatile bool destroying = false;
+
+	std::mutex buffers_mutex;
+	std::vector<buf_t> available_buffers;
+	std::unordered_map<AMFSurface *, buf_t> active_buffers;
+
+	inline amf_fallback() : amf_base(true) {}
+	~amf_fallback() { os_atomic_set_bool(&destroying, true); }
+
+	void AMF_STD_CALL OnSurfaceDataRelease(amf::AMFSurface *surf) override
+	{
+		if (os_atomic_load_bool(&destroying))
+			return;
+
+		std::scoped_lock lock(buffers_mutex);
+
+		auto it = active_buffers.find(surf);
+		if (it != active_buffers.end()) {
+			available_buffers.push_back(std::move(it->second));
+			active_buffers.erase(it);
+		}
+	}
+
+	void init() override
+	{
+		AMF_RESULT res = amf_context->InitDX11(nullptr, AMF_DX11_1);
 		if (res != AMF_OK)
 			throw amf_error("InitDX11 failed", res);
 	}
@@ -481,7 +519,10 @@ try {
 	amf_surf->SetPts(cur_ts);
 	amf_surf->SetProperty(L"PTS", pts);
 
-	enc->active_textures[amf_surf.GetPtr()] = output_tex;
+	{
+		std::scoped_lock lock(enc->textures_mutex);
+		enc->active_textures[amf_surf.GetPtr()] = output_tex;
+	}
 
 	/* ------------------------------------ */
 	/* do actual encode                     */
@@ -508,6 +549,106 @@ try {
 	return false;
 }
 
+static buf_t alloc_buf(amf_fallback *enc)
+{
+	buf_t buf;
+	size_t size;
+
+	if (enc->amf_format == AMF_SURFACE_NV12) {
+		size = enc->linesize * enc->cy * 2;
+	} else if (enc->amf_format == AMF_SURFACE_RGBA) {
+		size = enc->linesize * enc->cy * 4;
+	} else if (enc->amf_format == AMF_SURFACE_P010) {
+		size = enc->linesize * enc->cy * 2 * 2;
+	}
+
+	buf.resize(size);
+	return buf;
+}
+
+static buf_t get_buf(amf_fallback *enc)
+{
+	std::scoped_lock lock(enc->buffers_mutex);
+	buf_t buf;
+
+	if (enc->available_buffers.size()) {
+		buf = std::move(enc->available_buffers.back());
+		enc->available_buffers.pop_back();
+	} else {
+		buf = alloc_buf(enc);
+	}
+
+	return buf;
+}
+
+static inline void copy_frame_data(amf_fallback *enc, buf_t &buf,
+				   struct encoder_frame *frame)
+{
+	uint8_t *dst = &buf[0];
+
+	if (enc->amf_format == AMF_SURFACE_NV12 ||
+	    enc->amf_format == AMF_SURFACE_P010) {
+		size_t size = enc->linesize * enc->cy;
+		memcpy(&buf[0], frame->data[0], size);
+		memcpy(&buf[size], frame->data[1], size / 2);
+
+	} else if (enc->amf_format == AMF_SURFACE_RGBA) {
+		memcpy(dst, frame->data[0], enc->linesize * enc->cy);
+	}
+}
+
+static bool amf_encode_fallback(void *data, struct encoder_frame *frame,
+				struct encoder_packet *packet,
+				bool *received_packet)
+try {
+	amf_fallback *enc = (amf_fallback *)data;
+	AMFSurfacePtr amf_surf;
+	AMF_RESULT res;
+	buf_t buf;
+
+	if (!enc->linesize)
+		enc->linesize = frame->linesize[0];
+
+	if (enc->available_buffers.size()) {
+		buf = std::move(enc->available_buffers.back());
+		enc->available_buffers.pop_back();
+	} else {
+		buf = alloc_buf(enc);
+	}
+
+	copy_frame_data(enc, buf, frame);
+
+	res = enc->amf_context->CreateSurfaceFromHostNative(
+		enc->amf_format, enc->cx, enc->cy, enc->linesize, 0, &buf[0],
+		&amf_surf, enc);
+	if (res != AMF_OK)
+		throw amf_error("CreateSurfaceFromHostNative failed", res);
+
+	int64_t last_ts = convert_to_amf_ts(enc, frame->pts - 1);
+	int64_t cur_ts = convert_to_amf_ts(enc, frame->pts);
+
+	amf_surf->SetPts(cur_ts);
+	amf_surf->SetProperty(L"PTS", frame->pts);
+
+	{
+		std::scoped_lock lock(enc->buffers_mutex);
+		enc->active_buffers[amf_surf.GetPtr()] = std::move(buf);
+	}
+
+	/* ------------------------------------ */
+	/* do actual encode                     */
+
+	amf_encode_base(enc, amf_surf, packet, received_packet);
+	return true;
+
+} catch (const amf_error &err) {
+	amf_texencode *enc = (amf_texencode *)data;
+	error("%s: %s: %s", __FUNCTION__, err.str,
+	      amf_trace->GetResultText(err.res));
+	*received_packet = false;
+	return false;
+}
+
 static bool amf_extra_data(void *data, uint8_t **header, size_t *size)
 {
 	amf_base *enc = (amf_base *)data;
@@ -517,6 +658,37 @@ static bool amf_extra_data(void *data, uint8_t **header, size_t *size)
 	*header = (uint8_t *)enc->header->GetNative();
 	*size = enc->header->GetSize();
 	return true;
+}
+
+static void h264_video_info_fallback(void *, struct video_scale_info *info)
+{
+	switch (info->format) {
+	case VIDEO_FORMAT_RGBA:
+	case VIDEO_FORMAT_BGRA:
+	case VIDEO_FORMAT_BGRX:
+		info->format = VIDEO_FORMAT_RGBA;
+		break;
+	default:
+		info->format = VIDEO_FORMAT_NV12;
+		break;
+	}
+}
+
+static void h265_video_info_fallback(void *, struct video_scale_info *info)
+{
+	switch (info->format) {
+	case VIDEO_FORMAT_RGBA:
+	case VIDEO_FORMAT_BGRA:
+	case VIDEO_FORMAT_BGRX:
+		info->format = VIDEO_FORMAT_RGBA;
+		break;
+	case VIDEO_FORMAT_I010:
+	case VIDEO_FORMAT_P010:
+		info->format = VIDEO_FORMAT_P010;
+		break;
+	default:
+		info->format = VIDEO_FORMAT_NV12;
+	}
 }
 
 static bool amf_create_encoder(amf_base *enc)
@@ -529,14 +701,26 @@ try {
 	struct obs_video_info ovi;
 	obs_get_video_info(&ovi);
 
+	struct video_scale_info info;
+	info.format = ovi.output_format;
+	info.colorspace = ovi.colorspace;
+	info.range = ovi.range;
+
+	if (enc->fallback) {
+		if (enc->codec == amf_codec_type::AVC)
+			h264_video_info_fallback(NULL, &info);
+		else
+			h265_video_info_fallback(NULL, &info);
+	}
+
 	enc->cx = obs_encoder_get_width(enc->encoder);
 	enc->cy = obs_encoder_get_height(enc->encoder);
 	enc->amf_frame_rate = AMFConstructRate(ovi.fps_num, ovi.fps_den);
 	enc->fps_num = (int)ovi.fps_num;
 	enc->fps_den = (int)ovi.fps_den;
-	enc->full_range = ovi.range == VIDEO_RANGE_FULL;
+	enc->full_range = info.range == VIDEO_RANGE_FULL;
 
-	switch (ovi.colorspace) {
+	switch (info.colorspace) {
 	case VIDEO_CS_601:
 		enc->amf_color_profile =
 			enc->full_range
@@ -547,7 +731,6 @@ try {
 			AMF_COLOR_TRANSFER_CHARACTERISTIC_SMPTE170M;
 		break;
 	case VIDEO_CS_DEFAULT:
-		[[fallthrough]];
 	case VIDEO_CS_709:
 		enc->amf_color_profile =
 			enc->full_range
@@ -586,12 +769,15 @@ try {
 		break;
 	}
 
-	switch (ovi.output_format) {
+	switch (info.format) {
 	case VIDEO_FORMAT_NV12:
 		enc->amf_format = AMF_SURFACE_NV12;
 		break;
 	case VIDEO_FORMAT_P010:
 		enc->amf_format = AMF_SURFACE_P010;
+		break;
+	case VIDEO_FORMAT_RGBA:
+		enc->amf_format = AMF_SURFACE_RGBA;
 		break;
 	}
 
@@ -626,23 +812,6 @@ static void amf_destroy(void *data)
 	delete enc;
 }
 
-static void h264_video_info(void *, struct video_scale_info *info)
-{
-	info->format = VIDEO_FORMAT_NV12;
-}
-
-static void h265_video_info(void *, struct video_scale_info *info)
-{
-	switch (info->format) {
-	case VIDEO_FORMAT_I010:
-	case VIDEO_FORMAT_P010:
-		info->format = VIDEO_FORMAT_P010;
-		break;
-	default:
-		info->format = VIDEO_FORMAT_NV12;
-	}
-}
-
 static void check_texture_encode_capability(obs_encoder_t *encoder, bool hevc)
 {
 	obs_video_info ovi;
@@ -664,9 +833,98 @@ static void check_texture_encode_capability(obs_encoder_t *encoder, bool hevc)
 
 #include "texture-amf-opts.hpp"
 
-extern "C" void amf_defaults(obs_data_t *settings);
-extern "C" obs_properties_t *amf_avc_properties(void *unused);
-extern "C" obs_properties_t *amf_hevc_properties(void *unused);
+static void amf_defaults(obs_data_t *settings)
+{
+	obs_data_set_default_int(settings, "bitrate", 2500);
+	obs_data_set_default_int(settings, "cqp", 20);
+	obs_data_set_default_string(settings, "rate_control", "CBR");
+	obs_data_set_default_string(settings, "preset", "hq");
+	obs_data_set_default_string(settings, "profile", "high");
+}
+
+static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p,
+				  obs_data_t *settings)
+{
+	const char *rc = obs_data_get_string(settings, "rate_control");
+	bool cqp = astrcmpi(rc, "CQP") == 0;
+
+	p = obs_properties_get(ppts, "bitrate");
+	obs_property_set_visible(p, !cqp);
+	p = obs_properties_get(ppts, "cqp");
+	obs_property_set_visible(p, cqp);
+	return true;
+}
+
+static obs_properties_t *amf_properties_internal(bool hevc)
+{
+	obs_properties_t *props = obs_properties_create();
+	obs_property_t *p;
+
+	p = obs_properties_add_list(props, "rate_control",
+				    obs_module_text("RateControl"),
+				    OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, "CBR", "CBR");
+	obs_property_list_add_string(p, "CQP", "CQP");
+	obs_property_list_add_string(p, "VBR", "VBR");
+
+	obs_property_set_modified_callback(p, rate_control_modified);
+
+	p = obs_properties_add_int(props, "bitrate", obs_module_text("Bitrate"),
+				   50, 300000, 50);
+	obs_property_int_set_suffix(p, " Kbps");
+
+	obs_properties_add_int(props, "cqp", obs_module_text("NVENC.CQLevel"),
+			       1, 30, 1);
+
+	obs_properties_add_int(props, "keyint_sec",
+			       obs_module_text("KeyframeIntervalSec"), 0, 10,
+			       1);
+
+	p = obs_properties_add_list(props, "preset", obs_module_text("Preset"),
+				    OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+
+#define add_preset(val) \
+	obs_property_list_add_string(p, obs_module_text("AMF.Preset." val), val)
+	add_preset("quality");
+	add_preset("balanced");
+	add_preset("speed");
+#undef add_preset
+
+	if (!hevc) {
+		p = obs_properties_add_list(props, "profile",
+					    obs_module_text("Profile"),
+					    OBS_COMBO_TYPE_LIST,
+					    OBS_COMBO_FORMAT_STRING);
+
+#define add_profile(val) obs_property_list_add_string(p, val, val)
+		add_profile("high");
+		add_profile("main");
+		add_profile("baseline");
+#undef add_profile
+	}
+
+	p = obs_properties_add_text(props, "ffmpeg_opts",
+				    obs_module_text("AMFOpts"),
+				    OBS_TEXT_DEFAULT);
+	obs_property_set_long_description(
+		p, obs_module_text("FFmpegOpts.ToolTip.Encoder"));
+
+	return props;
+}
+
+static obs_properties_t *amf_avc_properties(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return amf_properties_internal(false);
+}
+
+static obs_properties_t *amf_hevc_properties(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return amf_properties_internal(true);
+}
 
 /* ========================================================================= */
 /* AVC Implementation                                                        */
@@ -839,6 +1097,7 @@ try {
 
 	amf_texencode *enc = new amf_texencode;
 	enc->encoder = encoder;
+	enc->encoder_str = "texture-amf-h264";
 
 	if (!amf_init_d3d11(enc))
 		throw "Failed to create D3D11";
@@ -847,13 +1106,33 @@ try {
 	return enc;
 
 } catch (const amf_error &err) {
-	blog(LOG_ERROR, "[texture-amf] %s: %s: %s", __FUNCTION__, err.str,
+	blog(LOG_ERROR, "[texture-amf-h264] %s: %s: %s", __FUNCTION__, err.str,
 	     amf_trace->GetResultText(err.res));
-	return obs_encoder_create_rerouted(encoder, "h264_ffmpeg_amf");
+	return obs_encoder_create_rerouted(encoder, "h264_fallback_amf");
 
 } catch (const char *err) {
-	blog(LOG_ERROR, "[texture-amf] %s: %s", __FUNCTION__, err);
-	return obs_encoder_create_rerouted(encoder, "h264_ffmpeg_amf");
+	blog(LOG_ERROR, "[texture-amf-h264] %s: %s", __FUNCTION__, err);
+	return obs_encoder_create_rerouted(encoder, "h264_fallback_amf");
+}
+
+static void *amf_avc_create_fallback(obs_data_t *settings,
+				     obs_encoder_t *encoder)
+try {
+	amf_fallback *enc = new amf_fallback;
+	enc->encoder = encoder;
+	enc->encoder_str = "fallback-amf-h264";
+
+	amf_avc_create_internal(enc, settings);
+	return enc;
+
+} catch (const amf_error &err) {
+	blog(LOG_ERROR, "[texture-amf-h264] %s: %s: %s", __FUNCTION__, err.str,
+	     amf_trace->GetResultText(err.res));
+	return nullptr;
+
+} catch (const char *err) {
+	blog(LOG_ERROR, "[texture-amf-h264] %s: %s", __FUNCTION__, err);
+	return nullptr;
 }
 
 static void register_avc()
@@ -869,17 +1148,17 @@ static void register_avc()
 	amf_encoder_info.get_defaults = amf_defaults;
 	amf_encoder_info.get_properties = amf_avc_properties;
 	amf_encoder_info.get_extra_data = amf_extra_data;
-	amf_encoder_info.get_video_info = h264_video_info;
 	amf_encoder_info.caps = OBS_ENCODER_CAP_PASS_TEXTURE;
 
 	obs_register_encoder(&amf_encoder_info);
 
-	/*amf_encoder_info.id = "h264_texture_amf";//_fallback";
+	amf_encoder_info.id = "h264_fallback_amf";
 	amf_encoder_info.caps = OBS_ENCODER_CAP_INTERNAL;
 	amf_encoder_info.encode_texture = nullptr;
 	amf_encoder_info.create = amf_avc_create_fallback;
-	amf_encoder_info.encode = amf_encode;
-	obs_register_encoder(&amf_encoder_info);*/
+	amf_encoder_info.encode = amf_encode_fallback;
+	amf_encoder_info.get_video_info = h264_video_info_fallback;
+	obs_register_encoder(&amf_encoder_info);
 }
 
 /* ========================================================================= */
@@ -1009,19 +1288,13 @@ static inline amf_uint32 amf_nominal_level()
 	return (amf_uint32)(obs_get_video_hdr_nominal_peak_level() * lum_mul_f);
 }
 
-static void *amf_hevc_create(obs_data_t *settings, obs_encoder_t *encoder)
-try {
+static void amf_hevc_create_internal(amf_base *enc, obs_data_t *settings)
+{
 	AMF_RESULT res;
 	AMFVariant p;
 
-	check_texture_encode_capability(encoder, true);
-
-	amf_texencode *enc = new amf_texencode;
-	enc->encoder = encoder;
 	enc->codec = amf_codec_type::HEVC;
 
-	if (!amf_init_d3d11(enc))
-		throw "Failed to create D3D11";
 	if (!amf_create_encoder(enc))
 		throw "Failed to create encoder";
 
@@ -1079,17 +1352,51 @@ try {
 					    &p);
 	if (res == AMF_OK && p.type == AMF_VARIANT_INTERFACE)
 		enc->header = AMFBufferPtr(p.pInterface);
+}
 
+static void *amf_hevc_create_texencode(obs_data_t *settings,
+				       obs_encoder_t *encoder)
+try {
+	check_texture_encode_capability(encoder, true);
+
+	amf_texencode *enc = new amf_texencode;
+	enc->encoder = encoder;
+	enc->encoder_str = "texture-amf-h265";
+
+	if (!amf_init_d3d11(enc))
+		throw "Failed to create D3D11";
+
+	amf_hevc_create_internal(enc, settings);
 	return enc;
 
 } catch (const amf_error &err) {
-	blog(LOG_ERROR, "[texture-amf] %s: %s: %S", __FUNCTION__, err.str,
+	blog(LOG_ERROR, "[texture-amf-h265] %s: %s: %s", __FUNCTION__, err.str,
 	     amf_trace->GetResultText(err.res));
-	return obs_encoder_create_rerouted(encoder, "h265_ffmpeg_amf");
+	return obs_encoder_create_rerouted(encoder, "h265_fallback_amf");
 
 } catch (const char *err) {
-	blog(LOG_ERROR, "[texture-amf] %s: %s", __FUNCTION__, err);
-	return obs_encoder_create_rerouted(encoder, "h265_ffmpeg_amf");
+	blog(LOG_ERROR, "[texture-amf-h265] %s: %s", __FUNCTION__, err);
+	return obs_encoder_create_rerouted(encoder, "h265_fallback_amf");
+}
+
+static void *amf_hevc_create_fallback(obs_data_t *settings,
+				      obs_encoder_t *encoder)
+try {
+	amf_fallback *enc = new amf_fallback;
+	enc->encoder = encoder;
+	enc->encoder_str = "fallback-amf-h265";
+
+	amf_hevc_create_internal(enc, settings);
+	return enc;
+
+} catch (const amf_error &err) {
+	blog(LOG_ERROR, "[texture-amf-h265] %s: %s: %s", __FUNCTION__, err.str,
+	     amf_trace->GetResultText(err.res));
+	return nullptr;
+
+} catch (const char *err) {
+	blog(LOG_ERROR, "[texture-amf-h265] %s: %s", __FUNCTION__, err);
+	return nullptr;
 }
 
 static void register_hevc()
@@ -1099,15 +1406,24 @@ static void register_hevc()
 	amf_encoder_info.type = OBS_ENCODER_VIDEO;
 	amf_encoder_info.codec = "hevc";
 	amf_encoder_info.get_name = amf_hevc_get_name;
-	amf_encoder_info.create = amf_hevc_create;
+	amf_encoder_info.create = amf_hevc_create_texencode;
 	amf_encoder_info.destroy = amf_destroy;
 	amf_encoder_info.encode_texture = amf_encode_tex;
 	amf_encoder_info.get_defaults = amf_defaults;
 	amf_encoder_info.get_properties = amf_hevc_properties;
 	amf_encoder_info.get_extra_data = amf_extra_data;
-	amf_encoder_info.get_video_info = h265_video_info;
 	amf_encoder_info.caps = OBS_ENCODER_CAP_PASS_TEXTURE;
 
+	obs_register_encoder(&amf_encoder_info);
+
+	obs_register_encoder(&amf_encoder_info);
+
+	amf_encoder_info.id = "h265_fallback_amf";
+	amf_encoder_info.caps = OBS_ENCODER_CAP_INTERNAL;
+	amf_encoder_info.encode_texture = nullptr;
+	amf_encoder_info.create = amf_hevc_create_fallback;
+	amf_encoder_info.encode = amf_encode_fallback;
+	amf_encoder_info.get_video_info = h265_video_info_fallback;
 	obs_register_encoder(&amf_encoder_info);
 }
 

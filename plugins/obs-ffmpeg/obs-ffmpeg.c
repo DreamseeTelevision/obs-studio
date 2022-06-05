@@ -33,8 +33,6 @@ extern struct obs_encoder_info hevc_nvenc_encoder_info;
 #endif
 extern struct obs_encoder_info svt_av1_encoder_info;
 extern struct obs_encoder_info aom_av1_encoder_info;
-extern struct obs_encoder_info ffmpeg_amf_avc_encoder_info;
-extern struct obs_encoder_info ffmpeg_amf_hevc_encoder_info;
 
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(55, 27, 100)
 #define LIBAVUTIL_VAAPI_AVAILABLE
@@ -358,12 +356,6 @@ bool obs_module_load(void)
 
 #ifdef _WIN32
 	amf_load();
-#endif
-
-	register_encoder_if_available(&ffmpeg_amf_avc_encoder_info, "h264_amf");
-#if ENABLE_HEVC
-	register_encoder_if_available(&ffmpeg_amf_hevc_encoder_info,
-				      "hevc_amf");
 #endif
 
 #if !defined(_WIN32) && defined(LIBAVUTIL_VAAPI_AVAILABLE)
